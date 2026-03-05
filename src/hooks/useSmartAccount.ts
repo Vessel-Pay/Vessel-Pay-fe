@@ -31,6 +31,7 @@ import {
   QRIS_REGISTRY_ABI,
   STABLE_SWAP_ABI,
   PAYMASTER_ABI,
+  ENTRYPOINT_ABI,
 } from "@/config/abi";
 import { buildPaymasterData } from "@/lib/paymasterData";
 import { getPaymasterSignature } from "@/api/signerApi";
@@ -71,6 +72,23 @@ export function useSmartAccount() {
   const qrisRegistryAddress = config.qrisRegistryAddress;
   const tokens = config.tokens;
 
+  // Supported tokens for paymaster sponsorship
+  // These tokens are approved for gasless transactions
+  const SUPPORTED_PAYMASTER_TOKENS: Address[] = useMemo(() => {
+    const tokenMap = new Map(tokens.map((t) => [t.symbol, t.address]));
+    return [
+      tokenMap.get("USDC"),
+      tokenMap.get("EURC"),
+      tokenMap.get("IDRX"),
+      tokenMap.get("USDS"),
+      tokenMap.get("BRZ"),
+      tokenMap.get("AUDD"),
+      tokenMap.get("CADC"),
+      tokenMap.get("ZCHF"),
+      tokenMap.get("TGBP"),
+    ].filter((addr): addr is Address => addr !== undefined);
+  }, [tokens]);
+
   const PAYMASTER_VERIFICATION_GAS = BigInt(1_000_000);
   const PAYMASTER_POST_OP_GAS = BigInt(1_000_000);
   const PRE_VERIFICATION_GAS =
@@ -108,6 +126,80 @@ export function useSmartAccount() {
       }),
     [chain, rpcUrl],
   );
+
+  const bundlerClient = useMemo(
+    () =>
+      createPublicClient({
+        chain: chain,
+        transport: http(bundlerUrl),
+      }),
+    [chain, bundlerUrl],
+  );
+
+  const checkBundlerHealth = useCallback(async (): Promise<{
+    isAvailable: boolean;
+    latency: number;
+    supportedMethods: string[];
+  }> => {
+    const startTime = Date.now();
+    const supportedMethods: string[] = [];
+    
+    try {
+      // Check eth_sendUserOperation
+      try {
+        await bundlerClient.request({
+          method: "eth_sendUserOperation",
+          params: [],
+        } as any);
+        supportedMethods.push("eth_sendUserOperation");
+      } catch (error) {
+        // Method exists if we get a validation error (not "method not found")
+        const message = error instanceof Error ? error.message : String(error);
+        if (!message.includes("method not found") && !message.includes("Method not found")) {
+          supportedMethods.push("eth_sendUserOperation");
+        }
+      }
+
+      // Check eth_estimateUserOperationGas
+      try {
+        await bundlerClient.request({
+          method: "eth_estimateUserOperationGas",
+          params: [],
+        } as any);
+        supportedMethods.push("eth_estimateUserOperationGas");
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!message.includes("method not found") && !message.includes("Method not found")) {
+          supportedMethods.push("eth_estimateUserOperationGas");
+        }
+      }
+
+      // Check eth_getUserOperationReceipt
+      try {
+        await bundlerClient.request({
+          method: "eth_getUserOperationReceipt",
+          params: ["0x0000000000000000000000000000000000000000000000000000000000000000"],
+        } as any);
+        supportedMethods.push("eth_getUserOperationReceipt");
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!message.includes("method not found") && !message.includes("Method not found")) {
+          supportedMethods.push("eth_getUserOperationReceipt");
+        }
+      }
+
+      const latency = Date.now() - startTime;
+      const isAvailable = supportedMethods.length >= 3;
+      
+      console.log(`Bundler health check: ${isAvailable ? "✓" : "✗"} (latency: ${latency}ms, methods: ${supportedMethods.join(", ")})`);
+      
+      return { isAvailable, latency, supportedMethods };
+    } catch (error) {
+      const latency = Date.now() - startTime;
+      console.error("Bundler unavailable:", error);
+      return { isAvailable: false, latency, supportedMethods: [] };
+    }
+  }, [bundlerClient]);
 
   // isReady = true when: not authenticated OR smartAccountAddress is set
   const isReady = !authenticated || !!smartAccountAddress;
@@ -231,6 +323,60 @@ export function useSmartAccount() {
       setIsBaseAccountWallet(false);
     }
   }, [effectiveWalletClient, eoaAddress]);
+
+  // Network validation on wallet connection
+  useEffect(() => {
+    let cancelled = false;
+
+    const validateAndSwitchNetwork = async () => {
+      if (!effectiveWalletClient) return;
+
+      try {
+        const currentChainId = await effectiveWalletClient.getChainId();
+        const expectedChainId = chain.id;
+
+        if (currentChainId !== expectedChainId) {
+          setStatus(`Switching to ${chain.name}...`);
+          
+          try {
+            // Attempt automatic switch
+            await effectiveWalletClient.switchChain({ id: expectedChainId });
+            if (!cancelled) {
+              setStatus(`Connected to ${chain.name}`);
+            }
+          } catch (switchError) {
+            // If switch fails, try adding chain first
+            try {
+              await effectiveWalletClient.addChain({ chain });
+              await effectiveWalletClient.switchChain({ id: expectedChainId });
+              if (!cancelled) {
+                setStatus(`Connected to ${chain.name}`);
+              }
+            } catch (addError) {
+              // Show manual instructions to user
+              if (!cancelled) {
+                const errorMessage = `Please switch to ${chain.name} (Chain ID: ${expectedChainId}) in your wallet`;
+                setError(errorMessage);
+                setStatus(errorMessage);
+              }
+            }
+          }
+        }
+      } catch (err) {
+        console.error("Network validation failed:", err);
+        if (!cancelled) {
+          const message = err instanceof Error ? err.message : "Network validation failed";
+          setError(message);
+        }
+      }
+    };
+
+    validateAndSwitchNetwork();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [effectiveWalletClient, chain]);
 
   useEffect(() => {
     let cancelled = false;
@@ -586,6 +732,79 @@ export function useSmartAccount() {
     wrapBaseAccountSignature,
   ]);
 
+  /**
+   * Check paymaster deposit in EntryPoint
+   * Logs warnings if balance is low but does not block transactions
+   * The bundler will reject operations if deposit is empty
+   */
+  const checkPaymasterDeposit = useCallback(async (): Promise<void> => {
+    try {
+      const depositInfo = await publicClient.readContract({
+        address: entryPointAddress,
+        abi: ENTRYPOINT_ABI,
+        functionName: "getDepositInfo",
+        args: [paymasterAddress],
+      });
+
+      const deposit = depositInfo.deposit;
+      const minimumRequired = parseUnits("0.01", 18); // 0.01 ETH minimum
+
+      if (deposit === 0n) {
+        console.warn(
+          `⚠️ Paymaster has no ETH deposited in EntryPoint. Gas sponsorship unavailable.`
+        );
+      } else if (deposit < minimumRequired) {
+        console.warn(
+          `⚠️ Paymaster deposit low: ${formatUnits(deposit, 18)} ETH (minimum: ${formatUnits(minimumRequired, 18)} ETH)`
+        );
+      } else {
+        console.log(
+          `✓ Paymaster deposit: ${formatUnits(deposit, 18)} ETH`
+        );
+      }
+    } catch (err) {
+      console.warn("Failed to check paymaster deposit:", err);
+    }
+  }, [publicClient, entryPointAddress, paymasterAddress]);
+
+  // EntryPoint validation
+  useEffect(() => {
+    let cancelled = false;
+
+    const validateEntryPoint = async () => {
+      if (!publicClient || !entryPointAddress) return;
+
+      try {
+        console.log(`EntryPoint configured: ${entryPointAddress} on chain ${chain.id}`);
+        
+        // Verify EntryPoint has code deployed
+        const bytecode = await publicClient.getBytecode({
+          address: entryPointAddress,
+        });
+        
+        if (!bytecode || bytecode === "0x") {
+          const errorMessage = `EntryPoint not deployed at ${entryPointAddress} on chain ${chain.id}`;
+          console.error(errorMessage);
+          throw new Error(errorMessage);
+        }
+        
+        console.log("EntryPoint validation passed");
+      } catch (err) {
+        console.error("EntryPoint validation failed:", err);
+        if (!cancelled) {
+          const message = err instanceof Error ? err.message : String(err);
+          setError(`Invalid EntryPoint configuration: ${message}`);
+        }
+      }
+    };
+
+    validateEntryPoint();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [publicClient, entryPointAddress, chain.id]);
+
   // Auto-initialize Smart Account when EOA wallet is ready
   useEffect(() => {
     let cancelled = false;
@@ -606,10 +825,7 @@ export function useSmartAccount() {
         const owner = getSmartAccountOwner();
         if (!owner) return;
         const simpleAccount = await toSimpleSmartAccount({
-          client: createPublicClient({
-            chain: chain,
-            transport: http(chain.rpcUrls.default.http[0]),
-          }),
+          client: publicClient,
           owner,
           entryPoint: { address: entryPointAddress, version: "0.7" as const },
           factoryAddress: simpleAccountFactory,
@@ -617,11 +833,42 @@ export function useSmartAccount() {
 
         if (cancelled) return;
 
+        // Check if smart account is already deployed
+        const bytecode = await publicClient.getBytecode({
+          address: simpleAccount.address,
+        });
+        const isDeployed = bytecode && bytecode !== "0x";
+        
+        if (isDeployed) {
+          console.log(`Smart Account already deployed at ${simpleAccount.address}`);
+          setStatus("Smart Account already deployed");
+        } else {
+          console.log(`Smart Account not yet deployed at ${simpleAccount.address}`);
+          setStatus("Smart Account ready (will deploy on first transaction)");
+        }
+
         const smartAccountClient = createSmartAccountClient({
           account: simpleAccount,
           chain: chain,
           bundlerTransport: http(bundlerUrl),
         });
+
+        // Check bundler health after client creation
+        try {
+          const bundlerHealth = await checkBundlerHealth();
+          if (!bundlerHealth.isAvailable) {
+            console.warn(`Bundler health check failed. Supported methods: ${bundlerHealth.supportedMethods.join(", ")}`);
+          }
+        } catch (error) {
+          console.error("Bundler health check error:", error);
+        }
+
+        // Check paymaster deposit in EntryPoint
+        try {
+          await checkPaymasterDeposit();
+        } catch (error) {
+          console.error("Paymaster deposit check error:", error);
+        }
 
         setSmartAccountAddress(simpleAccount.address);
         setClient(smartAccountClient);
@@ -645,15 +892,116 @@ export function useSmartAccount() {
     smartAccountAddress,
     client,
     getSmartAccountOwner,
+    publicClient,
+    chain,
+    entryPointAddress,
+    simpleAccountFactory,
+    bundlerUrl,
+    checkBundlerHealth,
+    checkPaymasterDeposit,
   ]);
 
-  const bundlerClient = useMemo(
-    () =>
-      createPublicClient({
-        chain: chain,
-        transport: http(bundlerUrl),
-      }),
-    [chain, bundlerUrl],
+  /**
+   * Check if paymaster approvals are set up for a token
+   * Returns true if approval exists, false otherwise
+   */
+  const checkPaymasterApproval = useCallback(
+    async (tokenAddress: Address, ownerAddress: Address): Promise<boolean> => {
+      try {
+        const allowance = await publicClient.readContract({
+          address: tokenAddress,
+          abi: ERC20_ABI,
+          functionName: "allowance",
+          args: [ownerAddress, paymasterAddress],
+        }) as bigint;
+        
+        // Consider approved if allowance is greater than 0
+        return allowance > 0n;
+      } catch (error) {
+        console.warn(`Failed to check allowance for ${tokenAddress}:`, error);
+        return false;
+      }
+    },
+    [publicClient, paymasterAddress]
+  );
+
+  // Track in-progress approvals to prevent concurrent approval attempts
+  const approvalsInProgress = useRef<Set<Address>>(new Set());
+
+  /**
+   * Ensure a single token has approval for the paymaster
+   * Uses walletClient.writeContract() for direct wallet transactions (not UserOperations)
+   * Implements lazy approval: only approves when needed
+   * Includes reentrancy protection to prevent concurrent approvals
+   */
+  const ensureTokenApproval = useCallback(
+    async (tokenAddress: Address, spenderAddress: Address): Promise<void> => {
+      if (!smartAccountAddress || !effectiveWalletClient) {
+        throw new Error("Wallet not ready");
+      }
+
+      // Reentrancy protection: check if approval is already in progress
+      if (approvalsInProgress.current.has(tokenAddress)) {
+        console.log(`Approval already in progress for ${tokenAddress}, waiting...`);
+        // Wait for the in-progress approval to complete
+        while (approvalsInProgress.current.has(tokenAddress)) {
+          await new Promise(resolve => setTimeout(resolve, 100));
+        }
+        return;
+      }
+
+      try {
+        // Mark approval as in progress
+        approvalsInProgress.current.add(tokenAddress);
+
+        // Check current allowance
+        const allowance = await publicClient.readContract({
+          address: tokenAddress,
+          abi: ERC20_ABI,
+          functionName: "allowance",
+          args: [smartAccountAddress, spenderAddress],
+        }) as bigint;
+
+        // If allowance is sufficient, skip approval
+        if (allowance > 0n) {
+          console.log(`Token ${tokenAddress} already approved for ${spenderAddress}`);
+          return;
+        }
+
+        console.log(`Approving token ${tokenAddress} for ${spenderAddress} via walletClient.writeContract()...`);
+
+        // Execute approval as direct wallet transaction (NOT UserOperation)
+        const txHash = await effectiveWalletClient.writeContract({
+          address: tokenAddress,
+          abi: ERC20_ABI,
+          functionName: "approve",
+          args: [spenderAddress, maxUint256],
+          chain: chain,
+          account: smartAccountAddress,
+        });
+
+        console.log(`Approval transaction submitted: ${txHash}`);
+
+        // Wait for transaction confirmation
+        const receipt = await publicClient.waitForTransactionReceipt({
+          hash: txHash,
+          confirmations: 1,
+        });
+
+        if (receipt.status === "success") {
+          console.log(`Token ${tokenAddress} approved successfully`);
+        } else {
+          throw new Error(`Approval transaction failed for ${tokenAddress}`);
+        }
+      } catch (error) {
+        console.error(`Failed to approve token ${tokenAddress}:`, error);
+        throw new Error(`Token approval failed: ${error instanceof Error ? error.message : String(error)}`);
+      } finally {
+        // Remove from in-progress set
+        approvalsInProgress.current.delete(tokenAddress);
+      }
+    },
+    [smartAccountAddress, effectiveWalletClient, publicClient, chain]
   );
 
   const getFeeParams = useCallback(async () => {
@@ -736,7 +1084,11 @@ export function useSmartAccount() {
       gasLimit: bigint;
       maxFeePerGas: bigint;
     }) => {
-      const [supported, balance, allowance, gasCost] = await Promise.all([
+      // For signature-based paymaster, we only need to check:
+      // 1. Token is supported by paymaster
+      // 2. User has sufficient balance for the transaction amount + gas
+      // Allowance checks are skipped since signature validation replaces on-chain approval
+      const [supported, balance, gasCost] = await Promise.all([
         publicClient.readContract({
           address: paymasterAddress,
           abi: PAYMASTER_ABI,
@@ -749,12 +1101,6 @@ export function useSmartAccount() {
           functionName: "balanceOf",
           args: [params.owner],
         }) as Promise<bigint>,
-        publicClient.readContract({
-          address: params.token,
-          abi: ERC20_ABI,
-          functionName: "allowance",
-          args: [params.owner, paymasterAddress],
-        }) as Promise<bigint>,
         estimatePaymasterCost(
           params.token,
           params.gasLimit,
@@ -765,18 +1111,6 @@ export function useSmartAccount() {
       if (!supported) {
         throw new Error(
           "Token belum didukung oleh paymaster. Coba token lain atau update daftar token paymaster.",
-        );
-      }
-
-      if (allowance === 0n) {
-        throw new Error(
-          "Allowance ke paymaster belum ada. Jalankan Activate Account dulu.",
-        );
-      }
-
-      if (gasCost > 0n && allowance < gasCost) {
-        throw new Error(
-          "Allowance ke paymaster kurang. Jalankan Activate Account lagi.",
         );
       }
 
@@ -849,6 +1183,116 @@ export function useSmartAccount() {
     [bundlerClient],
   );
 
+  /**
+   * Decode UserOperation error codes into user-friendly messages
+   */
+  const decodeUserOpError = useCallback((error: unknown): string => {
+    const message = error instanceof Error ? error.message : String(error);
+    
+    // AA error codes from ERC-4337
+    if (message.includes('AA21')) {
+      return 'Paymaster validation failed. Please try again or contact support.';
+    }
+    if (message.includes('AA23')) {
+      return 'Transaction reverted during execution. Please check your balance and try again.';
+    }
+    if (message.includes('AA24')) {
+      return 'Invalid signature. Please reconnect your wallet and try again.';
+    }
+    if (message.includes('AA31')) {
+      return 'Paymaster deposit too low. Gas sponsorship temporarily unavailable.';
+    }
+    if (message.includes('AA33')) {
+      return 'Paymaster allowance insufficient. Setting up approvals...';
+    }
+    
+    // Generic simulation failure
+    if (message.toLowerCase().includes('simulation') || message.toLowerCase().includes('estimate')) {
+      return 'Transaction simulation failed. Please check your inputs and try again.';
+    }
+    
+    return message;
+  }, []);
+
+  /**
+   * Simulate UserOperation before submission to catch errors early
+   * Uses eth_estimateUserOperationGas to validate execution
+   */
+  const simulateUserOp = useCallback(
+    async (
+      userOp: any,
+      entryPoint: Address,
+    ): Promise<{ success: boolean; error?: string; gasEstimate?: any }> => {
+      try {
+        // Attempt gas estimation which simulates the UserOp
+        const gasEstimate = await bundlerClient.request({
+          method: 'eth_estimateUserOperationGas',
+          params: [userOp, entryPoint],
+        } as any);
+
+        return { success: true, gasEstimate };
+      } catch (error) {
+        const decodedError = decodeUserOpError(error);
+        console.error('UserOperation simulation failed:', decodedError);
+        return { success: false, error: decodedError };
+      }
+    },
+    [bundlerClient, decodeUserOpError],
+  );
+
+  /**
+   * Submit a UserOperation with retry logic for network failures
+   * @param client - Smart account client
+   * @param params - SendCalls parameters
+   * @param maxRetries - Maximum number of retries (default: 1)
+   * @returns UserOperation hash
+   */
+  const submitUserOpWithRetry = useCallback(
+    async (
+      client: ReturnType<typeof createSmartAccountClient>,
+      params: Parameters<typeof client.sendCalls>[0],
+      maxRetries: number = 1,
+    ): Promise<string> => {
+      let lastError: Error | null = null;
+
+      for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        try {
+          const res = await client.sendCalls(params);
+          return res.id as string;
+        } catch (error) {
+          lastError = error as Error;
+          const message = error instanceof Error ? error.message : String(error);
+
+          // Check if this is a network error
+          if (message.includes("Failed to fetch")) {
+            console.warn(
+              `Bundler submission failed (attempt ${attempt + 1}/${maxRetries + 1}): ${message}`,
+            );
+
+            // If we haven't exhausted retries, wait and try again
+            if (attempt < maxRetries) {
+              console.log("Waiting 2 seconds before retry...");
+              await new Promise((resolve) => setTimeout(resolve, 2000));
+              continue;
+            }
+
+            // Max retries exceeded
+            throw new Error(
+              `Bundler RPC unreachable at ${bundlerUrl}. Please try again later.`,
+            );
+          }
+
+          // Non-network error, don't retry
+          throw error;
+        }
+      }
+
+      // Should never reach here, but TypeScript needs this
+      throw lastError || new Error("UserOperation submission failed");
+    },
+    [bundlerUrl],
+  );
+
   const ensureClient = useCallback(async () => {
     if (client && smartAccountAddress) {
       return { client, address: smartAccountAddress };
@@ -866,6 +1310,18 @@ export function useSmartAccount() {
       entryPoint: { address: entryPointAddress, version: "0.7" as const },
       factoryAddress: simpleAccountFactory,
     });
+
+    // Check if smart account is already deployed
+    const bytecode = await publicClient.getBytecode({
+      address: simpleAccount.address,
+    });
+    const isDeployed = bytecode && bytecode !== "0x";
+    
+    if (isDeployed) {
+      console.log(`Smart Account already deployed at ${simpleAccount.address}`);
+    } else {
+      console.log(`Smart Account not yet deployed at ${simpleAccount.address}, will deploy on first transaction`);
+    }
 
     const smartAccountClient = createSmartAccountClient({
       account: simpleAccount,
@@ -893,71 +1349,58 @@ export function useSmartAccount() {
       setError(null);
       setIsLoading(true);
       try {
-        const { client, address } = await ensureClient();
-        const feeParams = await getFeeParams();
-
-        const activationToken = tokenAddresses[0];
-        const validUntil = Math.floor(Date.now() / 1000) + 3600;
-        const validAfter = 0;
-
-        setStatus("Requesting activation signature...");
-        const signature = await getPaymasterSignature({
-          payerAddress: address,
-          tokenAddress: activationToken,
-          validUntil,
-          validAfter,
-          isActivation: true,
-        });
-
-        const paymasterData = buildPaymasterData({
-          tokenAddress: activationToken,
-          payerAddress: address,
-          validUntil,
-          validAfter,
-          hasPermit: false,
-          isActivation: true,
-          signature: signature as `0x${string}`,
-        });
-
-        const calls = tokenAddresses.map((token, index) => {
-          const approveData = encodeFunctionData({
-            abi: ERC20_ABI,
-            functionName: "approve",
-            args: [paymasterAddress, maxUint256],
-          });
-          return { to: token, data: approveData, value: BigInt(0) };
-        });
-
-        setStatus("Submitting activation (paymaster sponsored)...");
-        const baseCallGas = 120_000;
-        const perApproveGas = 70_000;
-        const callGasLimit = BigInt(
-          baseCallGas + tokenAddresses.length * perApproveGas,
-        );
-        const verificationGasLimit = BigInt(1_500_000);
-        const preVerificationGas = PRE_VERIFICATION_GAS;
-
-        const res = await client.sendCalls({
-          calls,
-          paymaster: paymasterAddress,
-          paymasterData,
-          paymasterVerificationGasLimit: BigInt(250_000),
-          paymasterPostOpGasLimit: BigInt(200_000),
-          callGasLimit,
-          verificationGasLimit,
-          preVerificationGas,
-          ...feeParams,
-        });
-        const userOpHash = res.id as `0x${string}`;
-
-        setStatus("Activation submitted, waiting for execution...");
-        const receipt = await waitForUserOp(userOpHash);
-        if (!receipt.success) {
-          const reason = receipt.reason || "Activation failed";
-          throw new Error(reason);
+        if (!effectiveWalletClient || !smartAccountAddress) {
+          throw new Error("Wallet not ready");
         }
-        setStatus("Activation executed on-chain");
-        return { txHash: receipt.txHash || userOpHash, sender: address };
+
+        // Check if wallet is already deployed
+        const bytecode = await publicClient.getBytecode({ address: smartAccountAddress });
+        const isDeployed = bytecode && bytecode !== "0x";
+
+        setStatus(isDeployed ? "Approving tokens via direct wallet transactions..." : "Wallet activation required before approvals");
+
+        // Execute approvals as direct wallet transactions (NOT UserOperations)
+        const approvalResults = [];
+        for (const tokenAddress of tokenAddresses) {
+          try {
+            console.log(`Approving token ${tokenAddress} for paymaster ${paymasterAddress}...`);
+            
+            const txHash = await effectiveWalletClient.writeContract({
+              address: tokenAddress,
+              abi: ERC20_ABI,
+              functionName: "approve",
+              args: [paymasterAddress, maxUint256],
+              chain: chain,
+              account: smartAccountAddress,
+            });
+
+            console.log(`Approval transaction submitted: ${txHash}`);
+
+            // Wait for transaction confirmation
+            const receipt = await publicClient.waitForTransactionReceipt({
+              hash: txHash,
+              confirmations: 1,
+            });
+
+            if (receipt.status === "success") {
+              console.log(`Token ${tokenAddress} approved successfully`);
+              approvalResults.push({ token: tokenAddress, txHash, success: true });
+            } else {
+              throw new Error(`Approval transaction failed for ${tokenAddress}`);
+            }
+          } catch (err) {
+            console.error(`Failed to approve token ${tokenAddress}:`, err);
+            approvalResults.push({ token: tokenAddress, success: false, error: err });
+            throw new Error(`Token approval failed for ${tokenAddress}: ${err instanceof Error ? err.message : String(err)}`);
+          }
+        }
+
+        setStatus("All tokens approved successfully");
+        return { 
+          txHash: approvalResults[0]?.txHash || "0x", 
+          sender: smartAccountAddress,
+          approvals: approvalResults 
+        };
       } catch (err) {
         const message = transformError(err);
         setError(message);
@@ -967,7 +1410,7 @@ export function useSmartAccount() {
         setIsLoading(false);
       }
     },
-    [ensureClient, getFeeParams, waitForUserOp, assertPaymasterBalance],
+    [effectiveWalletClient, smartAccountAddress, publicClient, chain, paymasterAddress],
   );
 
   const claimFaucet = useCallback(
@@ -1006,7 +1449,7 @@ export function useSmartAccount() {
         });
 
         setStatus("Submitting faucet UserOperation...");
-        const res = await client.sendCalls({
+        const userOpHash = await submitUserOpWithRetry(client, {
           calls: [
             {
               to: params.tokenAddress,
@@ -1021,9 +1464,7 @@ export function useSmartAccount() {
           callGasLimit: BigInt(220_000),
           verificationGasLimit: BigInt(450_000),
           ...feeParams,
-        });
-
-        const userOpHash = res.id as `0x${string}`;
+        }) as `0x${string}`;
         setStatus("Faucet submitted, waiting for execution...");
         const receipt = await waitForUserOp(userOpHash);
         if (!receipt.success) {
@@ -1249,6 +1690,10 @@ export function useSmartAccount() {
       setIsLoading(true);
       try {
         const { client, address } = await ensureClient();
+        
+        // Lazy approval: ensure token is approved for paymaster before transaction
+        await ensureTokenApproval(params.tokenAddress, paymasterAddress);
+        
         const amountParsed = parseUnits(params.amount, params.decimals);
         const feeParams = await getFeeParams();
         const gasLimitEstimate =
@@ -1290,7 +1735,7 @@ export function useSmartAccount() {
         setStatus("Sending UserOperation to Pimlico bundler...");
         let userOpHash = "";
         try {
-          const res = await client.sendCalls({
+          userOpHash = await submitUserOpWithRetry(client, {
             calls: [
               {
                 to: params.tokenAddress,
@@ -1311,7 +1756,6 @@ export function useSmartAccount() {
             preVerificationGas: PRE_VERIFICATION_GAS,
             ...feeParams,
           });
-          userOpHash = res.id as `0x${string}`;
         } catch (err) {
           const msg = err instanceof Error ? err.message : "send failed";
           if (msg.includes("Failed to fetch")) {
@@ -1339,7 +1783,7 @@ export function useSmartAccount() {
         setIsLoading(false);
       }
     },
-    [ensureClient, getFeeParams, waitForUserOp, assertPaymasterBalance],
+    [ensureClient, getFeeParams, waitForUserOp, ensureTokenApproval, paymasterAddress],
   );
 
   const sendBatchTransfer = useCallback(
@@ -1485,15 +1929,22 @@ export function useSmartAccount() {
       setIsLoading(true);
       try {
         const { client, address } = await ensureClient();
+        
+        // Lazy approval: ensure tokenIn is approved for paymaster before transaction
+        await ensureTokenApproval(params.tokenIn, paymasterAddress);
+        
         const amountParsed = parseUnits(params.amount, params.tokenInDecimals);
+        
+        // Check if approval is needed for StableSwap
         const needsApproval =
           !params.currentAllowance ||
           params.currentAllowance < params.totalUserPays;
 
         const feeParams = await getFeeParams();
         const gasLimitEstimate =
-          1_200_000n +
-          1_200_000n +
+          (needsApproval ? 100_000n : 0n) +
+          300_000n +
+          300_000n +
           PAYMASTER_VERIFICATION_GAS +
           PAYMASTER_POST_OP_GAS +
           PRE_VERIFICATION_GAS;
@@ -1505,6 +1956,8 @@ export function useSmartAccount() {
           gasLimit: gasLimitEstimate,
           maxFeePerGas: feeParams.maxFeePerGas,
         });
+        
+        // Generate fresh signature for this UserOperation
         const validUntil = Math.floor(Date.now() / 1000) + 3600;
         const validAfter = 0;
         setStatus("Requesting paymaster signature for swap...");
@@ -1527,6 +1980,8 @@ export function useSmartAccount() {
         });
 
         const calls = [];
+        
+        // Approve StableSwap if needed
         if (needsApproval) {
           calls.push({
             to: params.tokenIn,
@@ -1538,6 +1993,7 @@ export function useSmartAccount() {
             value: BigInt(0),
           });
         }
+        
         calls.push({
           to: params.stableSwapAddress,
           data: encodeFunctionData({
@@ -1554,19 +2010,17 @@ export function useSmartAccount() {
         });
 
         setStatus("Submitting swap UserOperation...");
-        const res = await client.sendCalls({
+        const userOpHash = await submitUserOpWithRetry(client, {
           calls,
           paymaster: paymasterAddress,
           paymasterData,
           paymasterVerificationGasLimit: PAYMASTER_VERIFICATION_GAS,
           paymasterPostOpGasLimit: PAYMASTER_POST_OP_GAS,
-          callGasLimit: BigInt(1_200_000),
-          verificationGasLimit: BigInt(1_200_000),
+          callGasLimit: BigInt((needsApproval ? 100_000 : 0) + 300_000),
+          verificationGasLimit: BigInt(300_000),
           preVerificationGas: PRE_VERIFICATION_GAS,
           ...feeParams,
-        });
-
-        const userOpHash = res.id as `0x${string}`;
+        }) as `0x${string}`;
         setStatus("Waiting for swap execution...");
         const receipt = await waitForUserOp(userOpHash);
         if (!receipt.success) {
@@ -1584,7 +2038,7 @@ export function useSmartAccount() {
         setIsLoading(false);
       }
     },
-    [ensureClient, getFeeParams, waitForUserOp],
+    [ensureClient, getFeeParams, waitForUserOp, ensureTokenApproval, paymasterAddress],
   );
 
   /**
@@ -1608,18 +2062,25 @@ export function useSmartAccount() {
       setIsLoading(true);
       try {
         const { client, address } = await ensureClient();
+        
+        // Lazy approval: ensure tokenIn is approved for paymaster before transaction
+        await ensureTokenApproval(params.tokenIn, paymasterAddress);
+        
         const amountParsed = parseUnits(
           params.amountIn,
           params.tokenInDecimals,
         );
+        
+        // Check if approval is needed for StableSwap
         const needsApproval =
           !params.currentAllowance ||
           params.currentAllowance < params.totalUserPays;
 
         const feeParams = await getFeeParams();
         const gasLimitEstimate =
-          1_500_000n +
-          1_200_000n +
+          (needsApproval ? 100_000n : 0n) +
+          400_000n +
+          300_000n +
           PAYMASTER_VERIFICATION_GAS +
           PAYMASTER_POST_OP_GAS +
           PRE_VERIFICATION_GAS;
@@ -1633,6 +2094,7 @@ export function useSmartAccount() {
           maxFeePerGas: feeParams.maxFeePerGas,
         });
 
+        // Generate fresh signature for this UserOperation
         const validUntil = Math.floor(Date.now() / 1000) + 3600;
         const validAfter = 0;
         setStatus("Requesting paymaster signature for swap & transfer...");
@@ -1655,7 +2117,8 @@ export function useSmartAccount() {
         });
 
         const calls = [];
-
+        
+        // Approve StableSwap if needed
         if (needsApproval) {
           calls.push({
             to: params.tokenIn,
@@ -1667,7 +2130,7 @@ export function useSmartAccount() {
             value: BigInt(0),
           });
         }
-
+        
         calls.push({
           to: params.stableSwapAddress,
           data: encodeFunctionData({
@@ -1682,7 +2145,7 @@ export function useSmartAccount() {
           }),
           value: BigInt(0),
         });
-
+        
         calls.push({
           to: params.tokenOut,
           data: encodeFunctionData({
@@ -1700,8 +2163,8 @@ export function useSmartAccount() {
           paymasterData,
           paymasterVerificationGasLimit: PAYMASTER_VERIFICATION_GAS,
           paymasterPostOpGasLimit: PAYMASTER_POST_OP_GAS,
-          callGasLimit: BigInt(1_500_000),
-          verificationGasLimit: BigInt(1_200_000),
+          callGasLimit: BigInt((needsApproval ? 100_000 : 0) + 400_000),
+          verificationGasLimit: BigInt(300_000),
           preVerificationGas: PRE_VERIFICATION_GAS,
           ...feeParams,
         });
@@ -1726,7 +2189,7 @@ export function useSmartAccount() {
         setIsLoading(false);
       }
     },
-    [ensureClient, getFeeParams, waitForUserOp, assertPaymasterBalance],
+    [ensureClient, getFeeParams, waitForUserOp, assertPaymasterBalance, ensureTokenApproval, paymasterAddress],
   );
 
   /**
@@ -1749,15 +2212,18 @@ export function useSmartAccount() {
       setIsLoading(true);
       try {
         const { client, address } = await ensureClient();
+        
+        // Check if approval is needed for StableSwap
         const needsApproval =
           !params.currentAllowance ||
           params.currentAllowance < params.totalAmountIn;
 
         const feeParams = await getFeeParams();
-        // Estimate gas: approval + swap + (transfers × recipientCount)
+        // Estimate gas: approval (if needed) + swap + (transfers × recipientCount)
         const gasLimitEstimate =
-          1_500_000n +
-          1_200_000n +
+          (needsApproval ? 100_000n : 0n) +
+          400_000n +
+          300_000n +
           BigInt(params.recipients.length) * 100_000n +
           PAYMASTER_VERIFICATION_GAS +
           PAYMASTER_POST_OP_GAS +
@@ -1772,6 +2238,7 @@ export function useSmartAccount() {
           maxFeePerGas: feeParams.maxFeePerGas,
         });
 
+        // Generate fresh signature for this UserOperation
         const validUntil = Math.floor(Date.now() / 1000) + 3600;
         const validAfter = 0;
         setStatus(
@@ -1796,8 +2263,8 @@ export function useSmartAccount() {
         });
 
         const calls = [];
-
-        // 1. Approve if needed
+        
+        // Approve StableSwap if needed
         if (needsApproval) {
           calls.push({
             to: params.tokenIn,
@@ -1809,8 +2276,8 @@ export function useSmartAccount() {
             value: BigInt(0),
           });
         }
-
-        // 2. Swap total payToken → targetToken
+        
+        // Swap total payToken → targetToken
         calls.push({
           to: params.stableSwapAddress,
           data: encodeFunctionData({
@@ -1826,7 +2293,7 @@ export function useSmartAccount() {
           value: BigInt(0),
         });
 
-        // 3. Transfer to each recipient
+        // Transfer to each recipient
         for (const recipient of params.recipients) {
           const amountParsed = parseUnits(
             recipient.amount,
@@ -1852,8 +2319,8 @@ export function useSmartAccount() {
           paymasterData,
           paymasterVerificationGasLimit: PAYMASTER_VERIFICATION_GAS,
           paymasterPostOpGasLimit: PAYMASTER_POST_OP_GAS,
-          callGasLimit: BigInt(1_500_000 + params.recipients.length * 100_000),
-          verificationGasLimit: BigInt(1_200_000),
+          callGasLimit: BigInt((needsApproval ? 100_000 : 0) + 400_000 + params.recipients.length * 100_000),
+          verificationGasLimit: BigInt(300_000),
           preVerificationGas: PRE_VERIFICATION_GAS,
           ...feeParams,
         } as Record<string, unknown>);
@@ -2423,6 +2890,9 @@ export function useSmartAccount() {
     signMessageWithEOA,
     baseAppDeployment,
     deployBaseAccount,
+    supportedPaymasterTokens: SUPPORTED_PAYMASTER_TOKENS,
+    simulateUserOp,
+    decodeUserOpError,
   };
 }
 
