@@ -15,12 +15,9 @@ import {
   WalletButton,
   ChainSelector,
   BalanceDisplay,
-  ActivationModal,
   FaucetButton,
 } from "@/components/Wallet";
 import { useSmartAccount } from "@/hooks/useSmartAccount";
-import { useApprovalStatus } from "@/hooks/useApprovalStatus";
-import { useActiveChain } from "@/hooks/useActiveChain";
 
 const contentComponents = {
   send: SendContent,
@@ -35,24 +32,8 @@ const STORAGE_KEY = "vessel_active_menu";
 export default function Start() {
   const [activeMenu, setActiveMenu] = useState<MenuType>("send");
   const [isHydrated, setIsHydrated] = useState(false);
-  const [suppressActivation, setSuppressActivation] = useState(false);
 
-  const {
-    smartAccountAddress,
-    approvePaymaster,
-    status,
-    baseAppDeployment,
-    deployBaseAccount,
-  } = useSmartAccount();
-  const { config } = useActiveChain();
-  const { isApproved, isChecking, refresh, contextKey } =
-    useApprovalStatus(smartAccountAddress);
-
-  useEffect(() => {
-    setSuppressActivation(true);
-    const timer = setTimeout(() => setSuppressActivation(false), 1000);
-    return () => clearTimeout(timer);
-  }, [config.key]);
+  useSmartAccount(); // Initialize smart account automatically
 
   useEffect(() => {
     const saved = localStorage.getItem(STORAGE_KEY);
@@ -79,23 +60,6 @@ export default function Start() {
     () => contentComponents[activeMenu],
     [activeMenu],
   );
-
-  const handleActivate = async () => {
-    const tokenAddresses = config.tokens.map(
-      (token) => token.address as `0x${string}`,
-    );
-    await approvePaymaster(tokenAddresses);
-    await refresh(false);
-  };
-
-  // Show activation modal if connected but not approved
-  const currentContextKey = `${config.key}:${smartAccountAddress ?? "none"}`;
-  const showActivationModal =
-    !suppressActivation &&
-    smartAccountAddress &&
-    !isChecking &&
-    isApproved === false &&
-    contextKey === currentContextKey;
 
   if (!isHydrated) {
     return (
@@ -131,16 +95,6 @@ export default function Start() {
           </div>
         </div>
       </div>
-
-      {/* Activation Modal - Cannot be closed */}
-      {showActivationModal && smartAccountAddress && (
-        <ActivationModal
-          onActivate={handleActivate}
-          status={status}
-          baseAppDeployment={baseAppDeployment}
-          onDeployBase={deployBaseAccount}
-        />
-      )}
     </div>
   );
 }
