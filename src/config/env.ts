@@ -19,10 +19,7 @@ const parseNumber = (value: string, name: string) => {
 };
 
 export const env = {
-  pimlicoApiKey: requireEnv(
-    process.env.NEXT_PUBLIC_PIMLICO_API_KEY,
-    "NEXT_PUBLIC_PIMLICO_API_KEY",
-  ),
+  pimlicoApiKey: optionalEnv(process.env.NEXT_PUBLIC_PIMLICO_API_KEY),
   signerApiUrl: requireEnv(
     process.env.NEXT_PUBLIC_SIGNER_API_URL,
     "NEXT_PUBLIC_SIGNER_API_URL",

@@ -85,8 +85,10 @@ export const ETHERLINK_SHADOWNET = {
   testnet: true,
 } as const;
 
-const buildBundlerUrl = (chainId: number) =>
-  `https://api.pimlico.io/v2/${chainId}/rpc?apikey=${env.pimlicoApiKey}`;
+const buildBundlerUrl = (chainId: number) => {
+  const apiKey = env.pimlicoApiKey || "";
+  return `https://api.pimlico.io/v2/${chainId}/rpc?apikey=${apiKey}`;
+};
 
 export const CHAIN_CONFIGS: Record<ChainKey, ChainRuntimeConfig> = {
   base_sepolia: {
