@@ -10,7 +10,7 @@ import {
   type ChainRuntimeConfig,
 } from "@/config/chains";
 
-const STORAGE_KEY = "artapay_active_chain";
+const STORAGE_KEY = "vessel_active_chain";
 
 type ChainContextValue = {
   chainKey: ChainKey;
