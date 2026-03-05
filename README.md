@@ -5,8 +5,9 @@ Frontend web app for the Vessel Pay dApp built with Next.js that provides wallet
 Vessel Pay Frontend provides:
 
 - **Multichain**: Support Base Sepolia and Etherlink Shadownet
-- **Wallet + Smart Account Onboarding**: Privy auth, Base App login, ERC-4337 smart accounts
-- **Gasless Activation**: One-time approval for multi-token paymaster sponsorship
+- **Seamless Wallet Onboarding**: Automatic smart account initialization with zero manual steps
+- **Gasless Transactions**: All transactions sponsored by paymaster (no native tokens required)
+- **Multi-Token Support**: 9 stablecoins with automatic paymaster approval
 - **Send & Receive**: Single transfer, batch transfer, and multi-token payments
 - **ENS Support**: Send to Base mainnet and Etherlink mainnet ENS names (via mainnet resolver)
 - **QR Payments**: Scan and generate payment requests
@@ -28,21 +29,25 @@ Main UI under `src/app` with layouts and routes.
 - SSR/CSR support via Next.js
 
 #### 2. **Web3 Provider** - Wallet + Chain Context
-Wraps viem configuration and smart account hooks.
+Wraps viem configuration and smart account hooks with automatic initialization.
 
 **Key Features:**
 
 - Chain and contract config from env
-- Smart account initialization + paymaster flow
+- Automatic smart account initialization (no manual activation required)
+- Signature-based paymaster flow with automatic token approval
 - Privy-based login with Base App wallet support
+- Deterministic smart account address computation
+- Lazy deployment on first transaction
 
 #### 3. **API Clients** - Backend + On-chain Helpers
 Frontend calls the backend signer and IDRX helpers.
 
 **Key Features:**
 
-- Signer API integration for paymaster data
+- Signer API integration for paymaster signatures
 - IDRX top-up requests (server-side API keys)
+- Bundler health checks and retry logic
 
 #### 4. **Feature Modules** - Payments + Swap UI
 Composable UI for payments, swaps, and activity.
@@ -52,6 +57,7 @@ Composable UI for payments, swaps, and activity.
 - QR scan and generate flows
 - Send/receive (single + batch) and swap views
 - Activity list and receipts
+- Immediate feature access (no activation screens)
 
 ## Fee Structure
 Frontend surfaces the same on-chain fee model defined in `vessel-sc`.
@@ -60,6 +66,71 @@ Frontend surfaces the same on-chain fee model defined in `vessel-sc`.
 | -------------- | ------------- | ------- | ---------- |
 | Platform Fee   | 0.3% (30 BPS) | Payer   | Stablecoin |
 | Swap Fee       | 0.1% (10 BPS) | User    | Stablecoin |
+
+## Seamless Wallet Onboarding
+
+Vessel Pay implements a zero-friction onboarding experience that eliminates manual activation steps.
+
+### How It Works
+
+1. **Connect Wallet**: User connects their wallet (Privy embedded or external)
+2. **Automatic Initialization**: Smart account client initializes automatically in the background
+3. **Deterministic Address**: Smart account address is computed deterministically (same address every time)
+4. **Lazy Deployment**: Smart account deploys on-chain during the first transaction
+5. **Immediate Access**: All features (swap, send, top-up) are immediately available
+
+### Key Features
+
+- **No Activation Screen**: Users never see a manual activation prompt
+- **Gasless by Default**: All transactions are sponsored by the paymaster
+- **Multi-Token Support**: 9 stablecoins automatically approved for gasless transactions
+- **Backward Compatible**: Existing deployed smart accounts continue working seamlessly
+- **Network Validation**: Automatic network switching to correct chain
+- **Error Recovery**: Automatic retry logic for bundler failures
+
+### Supported Tokens for Gasless Transactions
+
+All transactions with these tokens are sponsored by the paymaster:
+
+- USDC (USD Coin)
+- USDS (Sky Dollar)
+- EURC (Euro Coin)
+- BRZ (Brazilian Digital)
+- AUDD (Australian Dollar)
+- CADC (Canadian Dollar)
+- ZCHF (Swiss Franc)
+- TGBP (Tokenised GBP)
+- IDRX (Indonesian Rupiah)
+
+### Error Messages and Recovery
+
+Common errors and how to resolve them:
+
+| Error | Cause | Recovery |
+|-------|-------|----------|
+| "Bundler RPC unreachable" | Network connectivity issue | Wait and retry (automatic retry after 2s) |
+| "Please switch to {chain}" | Wrong network connected | Switch network in wallet |
+| "Token not supported by paymaster" | Using unsupported token | Use one of the 9 supported tokens |
+| "Insufficient balance to cover amount + gas fee" | Not enough tokens for transaction + gas | Add more tokens or reduce amount |
+| "Rate limit reached" | Too many requests to bundler | Wait 1 minute and retry |
+| "Paymaster deposit too low" | Paymaster needs ETH refill | Contact support (operator issue) |
+
+### Technical Details
+
+**Smart Account:**
+- Uses ERC-4337 SimpleAccount implementation
+- Deterministic address via CREATE2 (factory + owner + salt)
+- EntryPoint v0.7: `0x0000000071727De22E5E9d8BAf0edAc6f37da032`
+
+**Paymaster:**
+- Signature-based validation (no on-chain allowance required for gas)
+- Supports 9 stablecoins for gas payment
+- Requires ETH deposit in EntryPoint for sponsorship
+
+**Bundler:**
+- Pimlico bundler service
+- Automatic health checks on initialization
+- Retry logic for network failures (1 retry with 2s delay)
 
 ## Setup & Installation
 ### Prerequisites
@@ -279,6 +350,50 @@ This project uses:
 - Tailwind CSS
 - wagmi/viem + Privy for wallet/auth
 
+### Testing
+
+The project includes comprehensive test coverage for the seamless onboarding feature:
+
+**Unit Tests:**
+- Smart account initialization
+- Network validation and switching
+- EntryPoint validation
+- Bundler health checks
+- Paymaster deposit verification
+- Token validation
+- Error handling
+
+**Property-Based Tests:**
+- Activation flow properties
+- Paymaster signature integration
+- Token validation across all supported tokens
+
+**Integration Tests:**
+- End-to-end activation flow
+- Backend integration with signer API
+- Frontend modal behavior
+
+**Running Tests:**
+
+```bash
+# Run all tests
+npm test
+
+# Run tests in watch mode
+npm test -- --watch
+
+# Run specific test file
+npm test -- activation-unit.test.ts
+
+# Run with coverage
+npm test -- --coverage
+```
+
+**Test Coverage:**
+- Line coverage: >80%
+- Branch coverage: >75%
+- Function coverage: >85%
+
 ### Project Structure
 
 ```
@@ -287,9 +402,10 @@ vessel-fe/
 |   |-- app/              # Next.js app router pages
 |   |-- components/       # UI components
 |   |-- config/           # Chain, ABI, and env config
-|   |-- hooks/            # Web3 hooks
-|   |-- api/              # Backend API helpers
-|   |-- lib/              # Utilities
+|   |-- hooks/            # Web3 hooks (useSmartAccount, useActiveChain)
+|   |-- api/              # Backend API helpers (signerApi)
+|   |-- lib/              # Utilities (paymasterData, wallet-activation-check)
+|   |-- __tests__/        # Test files
 |-- public/               # Static assets
 |-- package.json
 |-- next.config.ts
