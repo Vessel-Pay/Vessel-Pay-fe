@@ -34,13 +34,18 @@ import {
   ENTRYPOINT_ABI,
 } from "@/config/abi";
 import { buildPaymasterData } from "@/lib/paymasterData";
-import { getPaymasterSignature } from "@/api/signerApi";
+import { getPaymasterSignature, getSignerAddress } from "@/api/signerApi";
+import { buildSwapCalldata } from "@/api/swapApi";
+import { env } from "@/config/env";
 
 /**
  * Transform pimlico rate limit errors into user-friendly messages
  */
 function transformError(err: unknown): string {
   const message = err instanceof Error ? err.message : String(err);
+  if (message.toLowerCase().includes("0xf4d678b8")) {
+    return "Pool has insufficient liquidity for this output token. Try a smaller amount or a different pair.";
+  }
   if (
     message.toLowerCase().includes("too many requests") ||
     message.toLowerCase().includes("rate limit")
@@ -122,7 +127,7 @@ export function useSmartAccount() {
     () =>
       createPublicClient({
         chain,
-        transport: http(rpcUrl),
+        transport: http(rpcUrl || "https://sepolia.base.org"),
       }),
     [chain, rpcUrl],
   );
@@ -131,7 +136,7 @@ export function useSmartAccount() {
     () =>
       createPublicClient({
         chain: chain,
-        transport: http(bundlerUrl),
+        transport: http(bundlerUrl || "https://api.pimlico.io/v2/base-sepolia/rpc"),
       }),
     [chain, bundlerUrl],
   );
@@ -143,7 +148,7 @@ export function useSmartAccount() {
   }> => {
     const startTime = Date.now();
     const supportedMethods: string[] = [];
-    
+
     try {
       // Check eth_sendUserOperation
       try {
@@ -190,9 +195,9 @@ export function useSmartAccount() {
 
       const latency = Date.now() - startTime;
       const isAvailable = supportedMethods.length >= 3;
-      
+
       console.log(`Bundler health check: ${isAvailable ? "✓" : "✗"} (latency: ${latency}ms, methods: ${supportedMethods.join(", ")})`);
-      
+
       return { isAvailable, latency, supportedMethods };
     } catch (error) {
       const latency = Date.now() - startTime;
@@ -337,7 +342,7 @@ export function useSmartAccount() {
 
         if (currentChainId !== expectedChainId) {
           setStatus(`Switching to ${chain.name}...`);
-          
+
           try {
             // Attempt automatic switch
             await effectiveWalletClient.switchChain({ id: expectedChainId });
@@ -776,18 +781,18 @@ export function useSmartAccount() {
 
       try {
         console.log(`EntryPoint configured: ${entryPointAddress} on chain ${chain.id}`);
-        
+
         // Verify EntryPoint has code deployed
         const bytecode = await publicClient.getBytecode({
           address: entryPointAddress,
         });
-        
+
         if (!bytecode || bytecode === "0x") {
           const errorMessage = `EntryPoint not deployed at ${entryPointAddress} on chain ${chain.id}`;
           console.error(errorMessage);
           throw new Error(errorMessage);
         }
-        
+
         console.log("EntryPoint validation passed");
       } catch (err) {
         console.error("EntryPoint validation failed:", err);
@@ -838,7 +843,7 @@ export function useSmartAccount() {
           address: simpleAccount.address,
         });
         const isDeployed = bytecode && bytecode !== "0x";
-        
+
         if (isDeployed) {
           console.log(`Smart Account already deployed at ${simpleAccount.address}`);
           setStatus("Smart Account already deployed");
@@ -914,7 +919,7 @@ export function useSmartAccount() {
           functionName: "allowance",
           args: [ownerAddress, paymasterAddress],
         }) as bigint;
-        
+
         // Consider approved if allowance is greater than 0
         return allowance > 0n;
       } catch (error) {
@@ -929,9 +934,74 @@ export function useSmartAccount() {
   const approvalsInProgress = useRef<Set<Address>>(new Set());
 
   /**
+   * Detect provider-side direct-send failures that should gracefully fall back
+   * to sponsored activation approval flow.
+   */
+  const shouldFallbackToSponsoredApproval = useCallback((error: unknown): boolean => {
+    const message = error instanceof Error ? error.message : String(error ?? "");
+    const normalized = message.toLowerCase();
+
+    // Existing failure mode: no native gas for direct wallet tx.
+    const insufficientNativeGas =
+      normalized.includes("insufficient funds") ||
+      normalized.includes("gas * price + value") ||
+      normalized.includes("gas \* price \+ value");
+
+    // Provider compatibility failures observed in production for wallet_sendTransaction.
+    const methodUnsupported =
+      normalized.includes("this request method is not supported") ||
+      normalized.includes("wallet_sendtransaction") ||
+      normalized.includes("code\":-32604") ||
+      normalized.includes("direct_approval_unsupported_provider") ||
+      normalized.includes("missing or invalid parameters") ||
+      (normalized.includes("http request failed") && normalized.includes("status: 400"));
+
+    return insufficientNativeGas || methodUnsupported;
+  }, []);
+
+  const authorizedSignerCheckCacheRef = useRef<Set<string>>(new Set());
+
+  const ensureBackendSignerAuthorized = useCallback(async () => {
+    const signerAddress = await getSignerAddress();
+    if (!signerAddress) {
+      throw new Error("Backend signer is not available from /signer endpoint.");
+    }
+
+    const normalizedSigner = getAddress(signerAddress as Address);
+    const cacheKey = `${chain.id}:${paymasterAddress.toLowerCase()}:${normalizedSigner.toLowerCase()}`;
+    if (authorizedSignerCheckCacheRef.current.has(cacheKey)) {
+      return;
+    }
+
+    const isAuthorized = (await publicClient.readContract({
+      address: paymasterAddress,
+      abi: [
+        {
+          type: "function",
+          name: "authorizedSigners",
+          stateMutability: "view",
+          inputs: [{ name: "signer", type: "address" }],
+          outputs: [{ type: "bool" }],
+        },
+      ],
+      functionName: "authorizedSigners",
+      args: [normalizedSigner],
+    })) as boolean;
+
+    if (!isAuthorized) {
+      throw new Error(
+        `Paymaster signer ${normalizedSigner} is not authorized on-chain for paymaster ${paymasterAddress}. Ask contract admin to authorize this signer first.`
+      );
+    }
+
+    authorizedSignerCheckCacheRef.current.add(cacheKey);
+  }, [chain.id, paymasterAddress, publicClient]);
+
+  /**
    * Ensure a single token has approval for the paymaster
    * Uses walletClient.writeContract() for direct wallet transactions (not UserOperations)
-   * Implements lazy approval: only approves when needed
+    * Falls back to one-time sponsored activation approval when native gas is unavailable
+    * Implements lazy approval: only approves when needed
    * Includes reentrancy protection to prevent concurrent approvals
    */
   const ensureTokenApproval = useCallback(
@@ -968,30 +1038,198 @@ export function useSmartAccount() {
           return;
         }
 
-        console.log(`Approving token ${tokenAddress} for ${spenderAddress} via walletClient.writeContract()...`);
+        try {
+          // Option 1: skip direct tx for provider types that are known to reject
+          // wallet_sendTransaction in this flow (e.g., embedded provider path).
+          const skipDirectApproval = walletSource === "embedded";
+          if (skipDirectApproval) {
+            throw new Error("direct_approval_unsupported_provider");
+          }
 
-        // Execute approval as direct wallet transaction (NOT UserOperation)
-        const txHash = await effectiveWalletClient.writeContract({
-          address: tokenAddress,
-          abi: ERC20_ABI,
-          functionName: "approve",
-          args: [spenderAddress, maxUint256],
-          chain: chain,
-          account: smartAccountAddress,
-        });
+          console.log(`Approving token ${tokenAddress} for ${spenderAddress} via walletClient.writeContract()...`);
 
-        console.log(`Approval transaction submitted: ${txHash}`);
+          // Primary path: direct wallet transaction.
+          const txHash = await effectiveWalletClient.writeContract({
+            address: tokenAddress,
+            abi: ERC20_ABI,
+            functionName: "approve",
+            args: [spenderAddress, maxUint256],
+            chain: chain,
+            account: smartAccountAddress,
+          });
 
-        // Wait for transaction confirmation
-        const receipt = await publicClient.waitForTransactionReceipt({
-          hash: txHash,
-          confirmations: 1,
-        });
+          console.log(`Approval transaction submitted: ${txHash}`);
 
-        if (receipt.status === "success") {
+          const receipt = await publicClient.waitForTransactionReceipt({
+            hash: txHash,
+            confirmations: 1,
+          });
+
+          if (receipt.status !== "success") {
+            throw new Error(`Approval transaction failed for ${tokenAddress}`);
+          }
           console.log(`Token ${tokenAddress} approved successfully`);
-        } else {
-          throw new Error(`Approval transaction failed for ${tokenAddress}`);
+          return;
+        } catch (directErr) {
+          const shouldFallback = shouldFallbackToSponsoredApproval(directErr);
+
+          if (!shouldFallback) {
+            throw directErr;
+          }
+
+          console.warn(
+            `Direct approval unavailable. Falling back to sponsored activation approval for ${tokenAddress}.`
+          );
+          setStatus("Direct approval unavailable; retrying with sponsored approval...");
+
+          const { client, address } = await ensureClient();
+
+          const submitSponsoredApproval = async (
+            gasToken: Address,
+            isActivation: boolean,
+            reasonLabel: string
+          ): Promise<void> => {
+            await ensureBackendSignerAuthorized();
+
+            const isAa34SignatureError = (error: unknown): boolean => {
+              const msg = error instanceof Error ? error.message.toLowerCase() : String(error ?? "").toLowerCase();
+              return msg.includes("aa34") || msg.includes("signature provided for the user operation is invalid");
+            };
+
+            let lastError: unknown;
+            for (let attempt = 0; attempt < 2; attempt += 1) {
+              try {
+                const validUntil = Math.floor(Date.now() / 1000) + 3600 + attempt;
+                const validAfter = 0;
+
+                const signature = await getPaymasterSignature({
+                  payerAddress: address,
+                  tokenAddress: gasToken,
+                  validUntil,
+                  validAfter,
+                  isActivation,
+                });
+
+                const paymasterData = buildPaymasterData({
+                  tokenAddress: gasToken,
+                  payerAddress: address,
+                  validUntil,
+                  validAfter,
+                  hasPermit: false,
+                  isActivation,
+                  signature: signature as `0x${string}`,
+                });
+
+                const feeParams = await getFeeParams();
+                const res = await client.sendCalls({
+                  calls: [
+                    {
+                      to: tokenAddress,
+                      data: encodeFunctionData({
+                        abi: ERC20_ABI,
+                        functionName: "approve",
+                        args: [spenderAddress, maxUint256],
+                      }),
+                      value: BigInt(0),
+                    },
+                  ],
+                  paymaster: paymasterAddress,
+                  paymasterData,
+                  paymasterVerificationGasLimit: PAYMASTER_VERIFICATION_GAS,
+                  paymasterPostOpGasLimit: PAYMASTER_POST_OP_GAS,
+                  callGasLimit: BigInt(160_000),
+                  verificationGasLimit: BigInt(500_000),
+                  preVerificationGas: PRE_VERIFICATION_GAS,
+                  ...feeParams,
+                });
+
+                const userOpHash = res.id as `0x${string}`;
+                const sponsoredReceipt = await waitForUserOp(userOpHash);
+                if (!sponsoredReceipt.success) {
+                  throw new Error(
+                    sponsoredReceipt.reason ||
+                    `Sponsored approval UserOperation failed for ${tokenAddress} (${reasonLabel})`
+                  );
+                }
+
+                return;
+              } catch (attemptError) {
+                lastError = attemptError;
+                if (!isAa34SignatureError(attemptError) || attempt > 0) {
+                  throw attemptError;
+                }
+
+                setStatus("Signer mismatch detected (AA34). Retrying with fresh signature...");
+              }
+            }
+
+            throw lastError instanceof Error
+              ? lastError
+              : new Error(`Sponsored approval failed for ${tokenAddress} (${reasonLabel})`);
+          };
+
+          try {
+            // First attempt: one-time activation sponsorship for first approval setup.
+            await submitSponsoredApproval(tokenAddress, true, "activation");
+            console.log(`Token ${tokenAddress} approved successfully via sponsored activation`);
+          } catch (activationErr) {
+            const activationMsg =
+              activationErr instanceof Error
+                ? activationErr.message.toLowerCase()
+                : String(activationErr ?? "").toLowerCase();
+
+            const alreadyActivated =
+              activationMsg.includes("already activated") ||
+              activationMsg.includes("already_activated");
+
+            if (!alreadyActivated) {
+              throw activationErr;
+            }
+
+            // Wallet is already activated: sponsor this approval using another already-approved gas token.
+            setStatus("Wallet already activated; retrying sponsorship with approved gas token...");
+
+            let fallbackGasToken: Address | null = null;
+            for (const candidateToken of SUPPORTED_PAYMASTER_TOKENS) {
+              try {
+                const candidateAllowance = (await publicClient.readContract({
+                  address: candidateToken,
+                  abi: ERC20_ABI,
+                  functionName: "allowance",
+                  args: [smartAccountAddress, paymasterAddress],
+                })) as bigint;
+
+                if (candidateAllowance <= 0n) {
+                  continue;
+                }
+
+                const candidateBalance = (await publicClient.readContract({
+                  address: candidateToken,
+                  abi: ERC20_ABI,
+                  functionName: "balanceOf",
+                  args: [smartAccountAddress],
+                })) as bigint;
+
+                if (candidateBalance > 0n) {
+                  fallbackGasToken = candidateToken;
+                  break;
+                }
+              } catch {
+                // Ignore token probe failures and continue trying other supported tokens.
+              }
+            }
+
+            if (!fallbackGasToken) {
+              throw new Error(
+                "Wallet is already activated on-chain and no previously approved paymaster gas token with balance was found."
+              );
+            }
+
+            await submitSponsoredApproval(fallbackGasToken, false, "approved-gas-token");
+            console.log(
+              `Token ${tokenAddress} approved successfully via sponsored fallback gas token ${fallbackGasToken}`
+            );
+          }
         }
       } catch (error) {
         console.error(`Failed to approve token ${tokenAddress}:`, error);
@@ -1001,7 +1239,7 @@ export function useSmartAccount() {
         approvalsInProgress.current.delete(tokenAddress);
       }
     },
-    [smartAccountAddress, effectiveWalletClient, publicClient, chain]
+    [smartAccountAddress, effectiveWalletClient, publicClient, chain, shouldFallbackToSponsoredApproval, walletSource, ensureBackendSignerAuthorized]
   );
 
   const getFeeParams = useCallback(async () => {
@@ -1188,7 +1426,7 @@ export function useSmartAccount() {
    */
   const decodeUserOpError = useCallback((error: unknown): string => {
     const message = error instanceof Error ? error.message : String(error);
-    
+
     // AA error codes from ERC-4337
     if (message.includes('AA21')) {
       return 'Paymaster validation failed. Please try again or contact support.';
@@ -1205,12 +1443,12 @@ export function useSmartAccount() {
     if (message.includes('AA33')) {
       return 'Paymaster allowance insufficient. Setting up approvals...';
     }
-    
+
     // Generic simulation failure
     if (message.toLowerCase().includes('simulation') || message.toLowerCase().includes('estimate')) {
       return 'Transaction simulation failed. Please check your inputs and try again.';
     }
-    
+
     return message;
   }, []);
 
@@ -1316,7 +1554,7 @@ export function useSmartAccount() {
       address: simpleAccount.address,
     });
     const isDeployed = bytecode && bytecode !== "0x";
-    
+
     if (isDeployed) {
       console.log(`Smart Account already deployed at ${simpleAccount.address}`);
     } else {
@@ -1364,7 +1602,7 @@ export function useSmartAccount() {
         for (const tokenAddress of tokenAddresses) {
           try {
             console.log(`Approving token ${tokenAddress} for paymaster ${paymasterAddress}...`);
-            
+
             const txHash = await effectiveWalletClient.writeContract({
               address: tokenAddress,
               abi: ERC20_ABI,
@@ -1396,10 +1634,10 @@ export function useSmartAccount() {
         }
 
         setStatus("All tokens approved successfully");
-        return { 
-          txHash: approvalResults[0]?.txHash || "0x", 
+        return {
+          txHash: approvalResults[0]?.txHash || "0x",
           sender: smartAccountAddress,
-          approvals: approvalResults 
+          approvals: approvalResults
         };
       } catch (err) {
         const message = transformError(err);
@@ -1690,10 +1928,10 @@ export function useSmartAccount() {
       setIsLoading(true);
       try {
         const { client, address } = await ensureClient();
-        
+
         // Lazy approval: ensure token is approved for paymaster before transaction
         await ensureTokenApproval(params.tokenAddress, paymasterAddress);
-        
+
         const amountParsed = parseUnits(params.amount, params.decimals);
         const feeParams = await getFeeParams();
         const gasLimitEstimate =
@@ -1929,12 +2167,12 @@ export function useSmartAccount() {
       setIsLoading(true);
       try {
         const { client, address } = await ensureClient();
-        
+
         // Lazy approval: ensure tokenIn is approved for paymaster before transaction
         await ensureTokenApproval(params.tokenIn, paymasterAddress);
-        
+
         const amountParsed = parseUnits(params.amount, params.tokenInDecimals);
-        
+
         // Check if approval is needed for StableSwap
         const needsApproval =
           !params.currentAllowance ||
@@ -1956,7 +2194,7 @@ export function useSmartAccount() {
           gasLimit: gasLimitEstimate,
           maxFeePerGas: feeParams.maxFeePerGas,
         });
-        
+
         // Generate fresh signature for this UserOperation
         const validUntil = Math.floor(Date.now() / 1000) + 3600;
         const validAfter = 0;
@@ -1979,8 +2217,40 @@ export function useSmartAccount() {
           signature: signature as `0x${string}`,
         });
 
+        let swapTarget = params.stableSwapAddress;
+        let swapData = encodeFunctionData({
+          abi: STABLE_SWAP_ABI,
+          functionName: "swap",
+          args: [
+            amountParsed,
+            params.tokenIn,
+            params.tokenOut,
+            params.minAmountOut,
+          ],
+        });
+
+        if (env.useBackendSwapBuild) {
+          try {
+            const backendBuild = await buildSwapCalldata({
+              tokenIn: params.tokenIn,
+              tokenOut: params.tokenOut,
+              amountIn: amountParsed,
+              minAmountOut: params.minAmountOut,
+              chainId: chain.id,
+              autoRoute: env.backendSwapAutoRoute,
+            });
+            swapTarget = getAddress(backendBuild.to as Address);
+            swapData = backendBuild.data as `0x${string}`;
+          } catch (buildError) {
+            console.warn(
+              "Backend /swap/build failed, falling back to local calldata build:",
+              buildError,
+            );
+          }
+        }
+
         const calls = [];
-        
+
         // Approve StableSwap if needed
         if (needsApproval) {
           calls.push({
@@ -1988,24 +2258,15 @@ export function useSmartAccount() {
             data: encodeFunctionData({
               abi: ERC20_ABI,
               functionName: "approve",
-              args: [params.stableSwapAddress, maxUint256],
+              args: [swapTarget, maxUint256],
             }),
             value: BigInt(0),
           });
         }
-        
+
         calls.push({
-          to: params.stableSwapAddress,
-          data: encodeFunctionData({
-            abi: STABLE_SWAP_ABI,
-            functionName: "swap",
-            args: [
-              amountParsed,
-              params.tokenIn,
-              params.tokenOut,
-              params.minAmountOut,
-            ],
-          }),
+          to: swapTarget,
+          data: swapData,
           value: BigInt(0),
         });
 
@@ -2062,15 +2323,15 @@ export function useSmartAccount() {
       setIsLoading(true);
       try {
         const { client, address } = await ensureClient();
-        
+
         // Lazy approval: ensure tokenIn is approved for paymaster before transaction
         await ensureTokenApproval(params.tokenIn, paymasterAddress);
-        
+
         const amountParsed = parseUnits(
           params.amountIn,
           params.tokenInDecimals,
         );
-        
+
         // Check if approval is needed for StableSwap
         const needsApproval =
           !params.currentAllowance ||
@@ -2117,7 +2378,7 @@ export function useSmartAccount() {
         });
 
         const calls = [];
-        
+
         // Approve StableSwap if needed
         if (needsApproval) {
           calls.push({
@@ -2130,7 +2391,7 @@ export function useSmartAccount() {
             value: BigInt(0),
           });
         }
-        
+
         calls.push({
           to: params.stableSwapAddress,
           data: encodeFunctionData({
@@ -2145,7 +2406,7 @@ export function useSmartAccount() {
           }),
           value: BigInt(0),
         });
-        
+
         calls.push({
           to: params.tokenOut,
           data: encodeFunctionData({
@@ -2212,7 +2473,7 @@ export function useSmartAccount() {
       setIsLoading(true);
       try {
         const { client, address } = await ensureClient();
-        
+
         // Check if approval is needed for StableSwap
         const needsApproval =
           !params.currentAllowance ||
@@ -2263,7 +2524,7 @@ export function useSmartAccount() {
         });
 
         const calls = [];
-        
+
         // Approve StableSwap if needed
         if (needsApproval) {
           calls.push({
@@ -2276,7 +2537,7 @@ export function useSmartAccount() {
             value: BigInt(0),
           });
         }
-        
+
         // Swap total payToken → targetToken
         calls.push({
           to: params.stableSwapAddress,

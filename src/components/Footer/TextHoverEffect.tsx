@@ -9,7 +9,7 @@ const bebas = Bebas_Neue({
 });
 
 export const TextHoverEffect = ({
-  text = "VESSEL PAY",
+  text = "ARTAPAY",
   duration,
 }: {
   text?: string;
@@ -36,25 +36,19 @@ export const TextHoverEffect = ({
   return (
     <div
       className="w-full flex items-center justify-center overflow-hidden"
-      // UBAHAN PENTING 1: 
-      // Hapus clamp height yang membatasi. Ganti dengan h-auto atau aspect-ratio.
-      // Kita biarkan SVG yang menentukan tingginya secara proporsional.
-      style={{ cursor: 'crosshair', height: 'auto' }} 
+      style={{ cursor: "crosshair", height: "auto" }}
     >
       <svg
         ref={svgRef}
         width="100%"
         height="100%"
-        // UBAHAN PENTING 2: ViewBox Dikecilkan (Di-ketat-kan).
-        // Sebelumnya "0 0 1320 300" (terlalu lebar).
-        // Sekarang "0 0 950 300". Angka 950 ini pas untuk kata "VESSEL PAY" font Bebas Neue.
-        viewBox="0 0 950 300" 
+        viewBox="0 0 950 300"
         preserveAspectRatio="xMidYMid meet"
         xmlns="http://www.w3.org/2000/svg"
         onMouseEnter={() => setHovered(true)}
         onMouseLeave={() => setHovered(false)}
         onMouseMove={(e) => setCursor({ x: e.clientX, y: e.clientY })}
-        className="select-none w-full" // Pastikan SVG width full
+        className="select-none w-full"
       >
         <defs>
           <linearGradient
@@ -97,13 +91,12 @@ export const TextHoverEffect = ({
           </mask>
         </defs>
 
-        {/* LAYER 1: Outline Stroke */}
         <motion.text
           x="50%"
           y="50%"
           textAnchor="middle"
           dominantBaseline="middle"
-          strokeWidth="2" // Sedikit ditipiskan agar elegan saat ukuran raksasa
+          strokeWidth="2"
           className={`${bebas.className} font-bold stroke-neutral-900/30 fill-transparent`}
           fontSize="300"
           initial={{ strokeDashoffset: 1000, strokeDasharray: 1000 }}
@@ -119,7 +112,6 @@ export const TextHoverEffect = ({
           {text}
         </motion.text>
 
-        {/* LAYER 2: Fill Color */}
         <text
           x="50%"
           y="50%"

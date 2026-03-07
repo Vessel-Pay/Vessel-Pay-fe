@@ -10,11 +10,13 @@ import { useActiveChain } from "@/hooks/useActiveChain";
 import {
   createPublicClient,
   formatUnits,
+  getAddress,
   http,
   parseUnits,
   type Address,
 } from "viem";
 import { STABLECOIN_REGISTRY_ABI } from "@/config/abi";
+import { env } from "@/config/env";
 
 interface IdRxTransaction {
   reference: string;
@@ -175,6 +177,18 @@ export default function TopUpIDRX() {
   const handleCreatePayment = async () => {
     if (!smartAccountAddress) return;
 
+    let normalizedWalletAddress: Address;
+    try {
+      normalizedWalletAddress = getAddress(smartAccountAddress as Address);
+    } catch {
+      setErrorModal({
+        isOpen: true,
+        title: "Invalid Wallet Address",
+        message: "Connected wallet address is invalid. Reconnect wallet and try again.",
+      });
+      return;
+    }
+
     if (!Number.isFinite(numericAmount) || numericAmount <= 0) {
       setErrorModal({
         isOpen: true,
@@ -224,12 +238,24 @@ export default function TopUpIDRX() {
 
       // Call backend endpoint to mint IDRX tokens
       // The backend will validate the request and execute the mint transaction
-      const backendUrl = process.env.NEXT_PUBLIC_SIGNER_API_URL || 'http://localhost:3001';
+      const backendUrl = env.signerApiUrl || "http://localhost:3001";
+      const idempotencyKey =
+        typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+          ? crypto.randomUUID()
+          : `topup-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      const headers: Record<string, string> = {
+        "Content-Type": "application/json",
+        "Idempotency-Key": idempotencyKey,
+      };
+      if (env.edgeTopupApiKey) {
+        headers["x-api-key"] = env.edgeTopupApiKey;
+      }
+
       const response = await fetch(`${backendUrl}/topup-idrx`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers,
         body: JSON.stringify({
-          walletAddress: smartAccountAddress,
+          walletAddress: normalizedWalletAddress,
           amount: amountToMint, // Amount in IDRX units (e.g., "100.50")
           chain: config.key, // Chain identifier (e.g., "base_sepolia")
         }),

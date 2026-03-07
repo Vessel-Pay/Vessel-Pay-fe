@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { ArrowUpDown, Loader2, AlertTriangle } from "lucide-react";
 import { Currency, buildCurrencies } from "@/components/Currency";
 import CurrencyBadge from "./CurrencyBadge";
@@ -45,6 +45,16 @@ export default function SwapToken() {
 
   const { smartAccountAddress, swapTokens, isLoading, isReady, status, error } =
     useSmartAccount();
+  const quoteRequestIdRef = useRef(0);
+
+  const isInsufficientLiquidityError = useCallback((err: unknown) => {
+    const message = err instanceof Error ? err.message : String(err ?? "");
+    const normalized = message.toLowerCase();
+    return (
+      normalized.includes("insufficient pool liquidity") ||
+      normalized.includes("0xf4d678b8")
+    );
+  }, []);
 
   const publicClient = useMemo(
     () =>
@@ -141,27 +151,44 @@ export default function SwapToken() {
     setQuoteError(null);
 
     const timer = setTimeout(async () => {
+      const requestId = ++quoteRequestIdRef.current;
+      const amountIn = parseUnits(amount, fromCurrency.decimals);
       try {
-        const amountIn = parseUnits(amount, fromCurrency.decimals);
         const quote = await fetchSwapQuote({
           tokenIn: fromCurrency.tokenAddress,
           tokenOut: toCurrency.tokenAddress,
           amountIn,
           chainId: config.chain.id,
         });
+        if (quoteRequestIdRef.current !== requestId) return;
         setSwapQuote(quote);
         setQuoteError(null);
       } catch (err) {
-        console.error("Quote error:", err);
-        setQuoteError(err instanceof Error ? err.message : "Quote failed");
-        setSwapQuote(null);
+        if (quoteRequestIdRef.current !== requestId) return;
+        if (isInsufficientLiquidityError(err)) {
+          setQuoteError(
+            "Selected token pair has insufficient liquidity for this amount. Try a smaller amount or choose another output token."
+          );
+          setSwapQuote(null);
+        } else {
+          console.error("Quote error:", err);
+          setQuoteError(err instanceof Error ? err.message : "Quote failed");
+          setSwapQuote(null);
+        }
       } finally {
+        if (quoteRequestIdRef.current !== requestId) return;
         setIsCalculating(false);
       }
     }, 1000);
 
     return () => clearTimeout(timer);
-  }, [amount, fromCurrency, toCurrency]);
+  }, [
+    amount,
+    fromCurrency,
+    toCurrency,
+    config.chain.id,
+    isInsufficientLiquidityError,
+  ]);
 
   // Swap currencies
   const handleSwapCurrencies = useCallback(() => {
@@ -169,6 +196,7 @@ export default function SwapToken() {
     setFromCurrency(toCurrency);
     setToCurrency(temp);
     setSwapQuote(null);
+    setQuoteError(null);
   }, [fromCurrency, toCurrency]);
 
   // Handle swap action
@@ -334,6 +362,13 @@ export default function SwapToken() {
         <div className="flex items-center justify-center gap-2 text-primary text-sm">
           <Loader2 className="w-4 h-4 animate-spin" />
           {status}
+        </div>
+      )}
+
+      {quoteError && (
+        <div className="flex items-center gap-2 p-3 bg-red-500/20 border border-red-500 rounded-lg text-red-300 text-sm">
+          <AlertTriangle className="w-4 h-4 shrink-0" />
+          <span>{quoteError}</span>
         </div>
       )}
 

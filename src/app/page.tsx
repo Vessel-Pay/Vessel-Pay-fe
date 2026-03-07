@@ -130,7 +130,7 @@ export default function Home() {
       {/* Footer Section */}
       <div
         ref={footerContainerRef}
-        className="min-h-screen w-full relative"
+        className="min-h-screen w-full relative footer-bg-dynamic"
         style={{
           backgroundColor: '#1A1A1A',
           scrollSnapAlign: 'start',

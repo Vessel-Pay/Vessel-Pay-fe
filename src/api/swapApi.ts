@@ -1,6 +1,11 @@
 import { env } from "@/config/env";
 
-const API_URL = env.signerApiUrl;
+function getApiUrl(): string {
+  if (!env.signerApiUrl) {
+    throw new Error("NEXT_PUBLIC_SIGNER_API_URL is not set");
+  }
+  return env.signerApiUrl;
+}
 
 export interface SwapQuoteResponse {
   tokenIn: string;
@@ -17,10 +22,10 @@ export async function fetchSwapQuote(params: {
   amountIn: bigint;
   chainId?: number;
 }): Promise<SwapQuoteResponse> {
+  const apiUrl = getApiUrl();
   const chainQuery = params.chainId ? `&chainId=${params.chainId}` : "";
-  const url = `${API_URL}/swap/quote?tokenIn=${params.tokenIn}&tokenOut=${
-    params.tokenOut
-  }&amountIn=${params.amountIn.toString()}${chainQuery}`;
+  const url = `${apiUrl}/swap/quote?tokenIn=${params.tokenIn}&tokenOut=${params.tokenOut
+    }&amountIn=${params.amountIn.toString()}${chainQuery}`;
   const res = await fetch(url);
   if (!res.ok) {
     const err = await res.json().catch(() => ({ message: "quote failed" }));
@@ -35,8 +40,10 @@ export async function buildSwapCalldata(params: {
   amountIn: bigint;
   minAmountOut: bigint;
   chainId?: number;
+  autoRoute?: boolean;
 }): Promise<{ to: string; data: string; value: string }> {
-  const res = await fetch(`${API_URL}/swap/build`, {
+  const apiUrl = getApiUrl();
+  const res = await fetch(`${apiUrl}/swap/build`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -45,6 +52,7 @@ export async function buildSwapCalldata(params: {
       amountIn: params.amountIn.toString(),
       minAmountOut: params.minAmountOut.toString(),
       ...(params.chainId ? { chainId: params.chainId } : {}),
+      ...(params.autoRoute !== undefined ? { autoRoute: params.autoRoute } : {}),
     }),
   });
 

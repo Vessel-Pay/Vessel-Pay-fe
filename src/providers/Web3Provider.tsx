@@ -19,8 +19,12 @@ const wagmiConfig = createConfig({
   chains: [BASE_SEPOLIA, ETHERLINK_SHADOWNET],
   connectors: [injected({ shimDisconnect: true })],
   transports: {
-    [BASE_SEPOLIA.id]: http(CHAIN_CONFIGS.base_sepolia.rpcUrl),
-    [ETHERLINK_SHADOWNET.id]: http(CHAIN_CONFIGS.etherlink_shadownet.rpcUrl),
+    [BASE_SEPOLIA.id]: http(
+      CHAIN_CONFIGS.base_sepolia.rpcUrl || "https://sepolia.base.org"
+    ),
+    [ETHERLINK_SHADOWNET.id]: http(
+      CHAIN_CONFIGS.etherlink_shadownet.rpcUrl || "https://node.ghostnet.etherlink.com"
+    ),
   },
   multiInjectedProviderDiscovery: false,
 });

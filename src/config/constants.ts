@@ -3,7 +3,7 @@ import type { ChainKey, ChainRuntimeConfig, TokenConfig } from "./chains";
 import { CHAIN_CONFIGS, DEFAULT_CHAIN_KEY, getChainConfig } from "./chains";
 
 export const DEFAULT_TOKEN_SYMBOL = env.defaultTokenSymbol;
-export const SIGNER_API_URL = env.signerApiUrl;
+export const SIGNER_API_URL = env.signerApiUrl ?? "";
 export const PIMLICO_API_KEY = env.pimlicoApiKey;
 export const DEFAULT_CHAIN = DEFAULT_CHAIN_KEY;
 

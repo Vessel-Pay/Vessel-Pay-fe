@@ -1,5 +1,13 @@
+const isNextProductionBuild =
+  process.env.NEXT_PHASE === "phase-production-build";
+
 const requireEnv = (value: string | undefined, name: string) => {
   if (!value) {
+    if (isNextProductionBuild) {
+      // Avoid hard-failing static prerender (e.g. /_not-found) when deploy-time
+      // env injection is incomplete; runtime paths still validate/use values.
+      return "";
+    }
     throw new Error(`${name} is not set`);
   }
   return value;
@@ -8,6 +16,11 @@ const requireEnv = (value: string | undefined, name: string) => {
 const optionalEnv = (value: string | undefined) => {
   if (!value || value.trim() === "") return undefined;
   return value;
+};
+
+const parseBoolean = (value: string | undefined, fallback = false) => {
+  if (!value || value.trim() === "") return fallback;
+  return value.trim().toLowerCase() === "true";
 };
 
 const parseNumber = (value: string, name: string) => {
@@ -20,14 +33,19 @@ const parseNumber = (value: string, name: string) => {
 
 export const env = {
   pimlicoApiKey: optionalEnv(process.env.NEXT_PUBLIC_PIMLICO_API_KEY),
-  signerApiUrl: requireEnv(
-    process.env.NEXT_PUBLIC_SIGNER_API_URL,
-    "NEXT_PUBLIC_SIGNER_API_URL",
+  signerApiUrl: optionalEnv(process.env.NEXT_PUBLIC_SIGNER_API_URL),
+  edgeSignApiKey: optionalEnv(process.env.NEXT_PUBLIC_EDGE_SIGN_API_KEY),
+  edgeTopupApiKey: optionalEnv(process.env.NEXT_PUBLIC_EDGE_TOPUP_API_KEY),
+  useBackendSwapBuild: parseBoolean(
+    process.env.NEXT_PUBLIC_USE_BACKEND_SWAP_BUILD,
+    false,
   ),
-  defaultTokenSymbol: requireEnv(
-    process.env.NEXT_PUBLIC_DEFAULT_TOKEN_SYMBOL,
-    "NEXT_PUBLIC_DEFAULT_TOKEN_SYMBOL",
+  backendSwapAutoRoute: parseBoolean(
+    process.env.NEXT_PUBLIC_BACKEND_SWAP_AUTO_ROUTE,
+    false,
   ),
+  defaultTokenSymbol:
+    optionalEnv(process.env.NEXT_PUBLIC_DEFAULT_TOKEN_SYMBOL) ?? "USDC",
   defaultChain: optionalEnv(process.env.NEXT_PUBLIC_DEFAULT_CHAIN),
   privyAppId: process.env.NEXT_PUBLIC_PRIVY_APP_ID,
   base: {
