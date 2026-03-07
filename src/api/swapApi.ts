@@ -14,6 +14,26 @@ export interface SwapQuoteResponse {
   amountOut: string;
   fee: string;
   totalUserPays: string;
+  aiAdvisory?: AiRoutingAdvisory;
+}
+
+export interface AiRoutingAdvisory {
+  enabled: boolean;
+  source: "deterministic" | "bedrock" | "sagemaker";
+  selectedChain: "base_sepolia" | "etherlink_shadownet";
+  confidence: number;
+  reason: string;
+  guardrailsPassed: boolean;
+  rejectedReason?: string;
+  estimatedFeeBps?: number;
+}
+
+export interface BuildSwapCalldataResponse {
+  to: string;
+  data: string;
+  value: string;
+  autoRouteApplied?: boolean;
+  aiAdvisory?: AiRoutingAdvisory;
 }
 
 export async function fetchSwapQuote(params: {
@@ -41,7 +61,7 @@ export async function buildSwapCalldata(params: {
   minAmountOut: bigint;
   chainId?: number;
   autoRoute?: boolean;
-}): Promise<{ to: string; data: string; value: string }> {
+}): Promise<BuildSwapCalldataResponse> {
   const apiUrl = getApiUrl();
   const res = await fetch(`${apiUrl}/swap/build`, {
     method: "POST",
@@ -62,5 +82,11 @@ export async function buildSwapCalldata(params: {
   }
 
   const data = await res.json();
-  return { to: data.to, data: data.data, value: data.value };
+  return {
+    to: data.to,
+    data: data.data,
+    value: data.value,
+    autoRouteApplied: data.autoRouteApplied,
+    aiAdvisory: data.aiAdvisory,
+  };
 }

@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
-import { ArrowUpDown, Loader2, AlertTriangle } from "lucide-react";
+import { ArrowUpDown, Loader2, AlertTriangle, Sparkles } from "lucide-react";
 import { Currency, buildCurrencies } from "@/components/Currency";
 import CurrencyBadge from "./CurrencyBadge";
 import CurrencyModal from "./CurrencyModal";
@@ -14,6 +14,7 @@ import { ReceiptPopUp, ReceiptData } from "@/components/ReceiptPopUp";
 import Modal from "@/components/Modal";
 import { useActiveChain } from "@/hooks/useActiveChain";
 import { isNoDataContractError, isRateLimitError } from "@/lib/viem-errors";
+import { env } from "@/config/env";
 
 export default function SwapToken() {
   const { config } = useActiveChain();
@@ -24,6 +25,9 @@ export default function SwapToken() {
   const [swapQuote, setSwapQuote] = useState<SwapQuoteResponse | null>(null);
   const [isCalculating, setIsCalculating] = useState(false);
   const [quoteError, setQuoteError] = useState<string | null>(null);
+  const [autoRouteEnabled, setAutoRouteEnabled] = useState(
+    env.backendSwapAutoRoute,
+  );
   const [balance, setBalance] = useState<string>("0");
   const [isLoadingBalance, setIsLoadingBalance] = useState(false);
 
@@ -80,6 +84,10 @@ export default function SwapToken() {
     setToCurrency(defaultTo);
     setSwapQuote(null);
   }, [config.defaultTokenSymbol, currencies]);
+
+  useEffect(() => {
+    setAutoRouteEnabled(env.backendSwapAutoRoute);
+  }, [config.chain.id]);
 
   const fetchBalance = useCallback(async () => {
     if (!smartAccountAddress) {
@@ -216,6 +224,7 @@ export default function SwapToken() {
         stableSwapAddress: config.stableSwapAddress,
         minAmountOut,
         totalUserPays: BigInt(swapQuote.totalUserPays),
+        autoRoute: autoRouteEnabled,
       });
 
       // Create receipt for successful swap
@@ -277,6 +286,16 @@ export default function SwapToken() {
         ) || 1)
       ).toFixed(4)
     : null;
+
+  const advisory = swapQuote?.aiAdvisory;
+
+  const advisoryChainLabel = useMemo(() => {
+    if (!advisory) return null;
+    if (advisory.selectedChain === "base_sepolia") {
+      return "Base Sepolia";
+    }
+    return "Etherlink Shadownet";
+  }, [advisory]);
 
   return (
     <div className="p-4 sm:p-6 space-y-6">
@@ -357,6 +376,61 @@ export default function SwapToken() {
         </div>
       )}
 
+      {swapQuote && !isCalculating && env.useBackendSwapBuild && (
+        <div className="space-y-3 p-3 rounded-lg border border-zinc-700 bg-zinc-900/60">
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex items-center gap-2 text-zinc-100 text-sm font-medium">
+              <Sparkles className="w-4 h-4 text-primary" />
+              <span>AI Routing</span>
+            </div>
+            <label className="flex items-center gap-2 text-xs text-zinc-300 cursor-pointer select-none">
+              <input
+                type="checkbox"
+                checked={autoRouteEnabled}
+                onChange={(event) => setAutoRouteEnabled(event.target.checked)}
+                className="accent-primary"
+              />
+              Auto-route
+            </label>
+          </div>
+
+          {advisory ? (
+            <div className="space-y-1 text-xs">
+              <div className="flex justify-between text-zinc-300">
+                <span>Provider</span>
+                <span className="uppercase">{advisory.source}</span>
+              </div>
+              <div className="flex justify-between text-zinc-300">
+                <span>Recommended chain</span>
+                <span>{advisoryChainLabel}</span>
+              </div>
+              <div className="flex justify-between text-zinc-300">
+                <span>Confidence</span>
+                <span>{Math.round((advisory.confidence || 0) * 100)}%</span>
+              </div>
+              {typeof advisory.estimatedFeeBps === "number" && (
+                <div className="flex justify-between text-zinc-300">
+                  <span>Estimated fee</span>
+                  <span>{advisory.estimatedFeeBps} bps</span>
+                </div>
+              )}
+              <div
+                className={`text-xs ${advisory.guardrailsPassed ? "text-emerald-300" : "text-amber-300"}`}
+              >
+                {advisory.guardrailsPassed
+                  ? "Guardrails passed"
+                  : `Guardrails fallback (${advisory.rejectedReason || "validation_failed"})`}
+              </div>
+              <div className="text-zinc-400">{advisory.reason}</div>
+            </div>
+          ) : (
+            <div className="text-xs text-zinc-400">
+              Advisory unavailable. Deterministic routing will be used.
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Status Message */}
       {isLoading && (
         <div className="flex items-center justify-center gap-2 text-primary text-sm">
@@ -388,7 +462,7 @@ export default function SwapToken() {
       {smartAccountAddress && hasNoBalance && amount === "" && (
         <div className="flex items-center gap-2 p-3 bg-zinc-700/50 border border-zinc-600 rounded-lg text-zinc-400 text-sm">
           <AlertTriangle className="w-4 h-4 shrink-0" />
-          <span>You don't have any {fromCurrency.symbol} tokens</span>
+          <span>You do not have any {fromCurrency.symbol} tokens</span>
         </div>
       )}
 

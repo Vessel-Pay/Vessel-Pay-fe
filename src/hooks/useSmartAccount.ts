@@ -2162,6 +2162,7 @@ export function useSmartAccount() {
       minAmountOut: bigint;
       totalUserPays: bigint;
       currentAllowance?: bigint;
+      autoRoute?: boolean;
     }) => {
       setError(null);
       setIsLoading(true);
@@ -2237,7 +2238,7 @@ export function useSmartAccount() {
               amountIn: amountParsed,
               minAmountOut: params.minAmountOut,
               chainId: chain.id,
-              autoRoute: env.backendSwapAutoRoute,
+              autoRoute: params.autoRoute ?? env.backendSwapAutoRoute,
             });
             swapTarget = getAddress(backendBuild.to as Address);
             swapData = backendBuild.data as `0x${string}`;
